@@ -1,0 +1,19 @@
+[package]
+name = "curl_test_cf_cdn_rust"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4.20"
+fern = "0.6.2"
+chrono = "0.4.31"
+threadpool = "1.8.1"
+ipnetwork = "0.20.0"
+rand = "0.8.5"
+url = "2.4.1"
+
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
