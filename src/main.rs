@@ -86,17 +86,32 @@ fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
         Ok(child) => {
             let output = child.wait_with_output()?; // 等待子进程完成
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // 如果curl输出中包含"apache"，提前返回结果
-            if stdout.to_lowercase().contains("cloudflare") {
-                return Ok((host_name.to_string(), true));
-            } else {
-                return Ok((host_name.to_string(),false))
+            // 如果curl输出中，server参数中是"cloudflare"
+            if let Some(server_header) = extract_server_header(&stdout) {
+                if server_header.contains("cloudflare") {
+                    return Ok((host_name.to_string(), true));
+                }
             }
+            return Ok((host_name.to_string(), false));
         }
         Err(_e) => {
             return Ok((host_name.to_string(),false))
         }
     }
+}
+
+// 提取响应头的server服务器是什么？cloudflare？
+fn extract_server_header(curl_output: &str) -> Option<String> {
+    let lines: Vec<&str> = curl_output.lines().collect();
+
+    for line in lines {
+        if line.starts_with("Server:") {
+            // 删除前后的空格并返回值
+            return Some(line["Server:".len()..].trim().to_string());
+        }
+    }
+
+    None
 }
 
 // 检查文件读取的地址是IPv4地址、IPv6地址、域名，如果是CIDR，就生成IP地址
