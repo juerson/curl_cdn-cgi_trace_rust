@@ -17,7 +17,7 @@ use ipnetwork::IpNetwork;
 use url::Url;
 use rand::Rng;
 use rand::seq::SliceRandom;
-
+use std::io::Read;
 
 // 初始化日志（设置日志格式）
 fn init_logger() -> Result<(), fern::InitError> {
@@ -46,7 +46,7 @@ fn is_curl_installed() -> bool {
     output
 }
 
-// 使用CURL命令（需要在电脑中安装curl才能使用，特别是windows系统中），判断headers头文件信息是否有cloudflare字符
+// 使用CURL命令（需要在电脑中就按照有curl才能使用），去检查url链接的状态码情况
 fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
     let formatted_ip = if let Ok(ip_network) = ip.parse::<IpNetwork>() {
         if ip_network.is_ipv6() {
@@ -55,7 +55,7 @@ fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
             ip_network.ip().to_string()
         }
     } else {
-        let trimmed_ip = if ip.ends_with('/') { // 用于去掉右侧"/"的字符
+        let trimmed_ip = if ip.ends_with('/') { // 用于去掉右侧“/”的字符
             ip.trim_end_matches('/').to_string()
         } else {
             ip.to_string()
@@ -64,7 +64,7 @@ fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
     };
     let host_name = if formatted_ip.starts_with("http://") || formatted_ip.starts_with("https://") {
         let url_parse = Url::parse(&formatted_ip).unwrap(); // 解析URL
-        let domain = url_parse.host_str().unwrap_or_default().to_string(); // 提取域名
+        let domain = url_parse.host_str().unwrap_or_default().to_string(); // 提取域名并返回
         domain
     } else {
         formatted_ip
@@ -72,31 +72,30 @@ fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
     let url = format!("http://{}/cdn-cgi/trace", host_name);
     
     let curl_process = Command::new("curl")
-        .arg("/dev/null")
         .arg("-I")
         .arg(url)
-        .arg("-s")
         .arg("-m")
-        .arg("10") // 设置超时(单位：秒)
+        .arg("5") // 设置超时(单位：秒)
         .stdout(Stdio::piped())
-        .spawn();
-        
-    // 检查curl进程是否成功启动
-    match curl_process {
-        Ok(child) => {
-            let output = child.wait_with_output()?; // 等待子进程完成
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // 如果curl输出中包含"apache"，提前返回结果
-            if stdout.to_lowercase().contains("cloudflare") {
-                return Ok((host_name.to_string(), true));
-            } else {
-                return Ok((host_name.to_string(),false))
+        .spawn()?;
+
+    if let Some(stdout) = curl_process.stdout {
+        let findstr_process = Command::new("findstr")
+            .arg("Server")
+            .stdin(Stdio::from(stdout))
+            .stdout(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdout) = findstr_process.stdout {
+            let mut server_output = String::new();
+            if let Ok(_) = stdout.read_to_string(&mut server_output) {
+                if server_output.to_lowercase().contains("cloudflare") {
+                    return Ok((host_name.to_string(),true));
+                }
             }
         }
-        Err(_e) => {
-            return Ok((host_name.to_string(),false))
-        }
     }
+
+    Ok((host_name.to_string(),false))
 }
 
 // 检查文件读取的地址是IPv4地址、IPv6地址、域名，如果是CIDR，就生成IP地址
@@ -274,7 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     
     // 线程池：调用check_server_is_cloudflare函数，获取测试后的结果
-    let pool_method = threadpool::ThreadPool::new(100);
+    let pool_method = threadpool::ThreadPool::new(10);
     /* mpsc通道，用于在线程之间安全地传递数据，其中一个线程（或多个线程）充当生产者，而另一个线程（单个线程）充当消费者。
        mpsc（多个生产者、单个消费者）通道，创建了两个端点，一个发送端 (tx_method) 和一个接收端 (rx_method)。
        这种通道类型在并发编程中非常有用，因为它提供了一种线程间通信的方式，以避免竞态条件和数据竞争。
@@ -314,7 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 转换为人类易读的时间
     let (elapsed_time, unit) = format_duration(elapsed_duration);
 
-    print!("\n程序运行结束，耗时：{:.2}{}，", elapsed_time,unit);
+    print!("\n程序运行结束，耗时：{:.2} {}，", elapsed_time, unit);
     io::stdout().flush().expect("Failed to flush stdout");
     wait_for_enter();
     

@@ -1,0 +1,1 @@
+该代码只扫描ip或域名+/cdn-cgi/trace
