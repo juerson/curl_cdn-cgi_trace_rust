@@ -1,23 +1,16 @@
-extern crate fern;
-extern crate chrono;
-extern crate threadpool;
-extern crate ipnetwork;
-extern crate rand;
-extern crate url;
-
-use std::fs::File;
-use std::io::{self, BufRead, Write};
-use std::net::IpAddr;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
-use std::net::Ipv6Addr;
-use std::str::FromStr;
 use ipnetwork::IpNetwork;
+use rand::{seq::SliceRandom, Rng};
+use std::{
+    fs::File,
+    io::{self, BufRead, Write},
+    net::{IpAddr, Ipv6Addr},
+    process::{Command, Stdio},
+    str::FromStr,
+    sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant},
+};
+use threadpool::ThreadPool;
 use url::Url;
-use rand::Rng;
-use rand::seq::SliceRandom;
-
 
 // 初始化日志（设置日志格式）
 fn init_logger() -> Result<(), fern::InitError> {
@@ -38,10 +31,7 @@ fn init_logger() -> Result<(), fern::InitError> {
 
 // 检查curl是否已经在电脑中安装好
 fn is_curl_installed() -> bool {
-    let output = Command::new("curl")
-        .arg("--version")
-        .output()
-        .is_ok(); // 检查命令执行是否成功
+    let output = Command::new("curl").arg("--version").output().is_ok(); // 检查命令执行是否成功
 
     output
 }
@@ -55,7 +45,8 @@ fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
             ip_network.ip().to_string()
         }
     } else {
-        let trimmed_ip = if ip.ends_with('/') { // 用于去掉右侧"/"的字符
+        let trimmed_ip = if ip.ends_with('/') {
+            // 用于去掉右侧"/"的字符
             ip.trim_end_matches('/').to_string()
         } else {
             ip.to_string()
@@ -70,17 +61,17 @@ fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
         formatted_ip
     };
     let url = format!("http://{}/cdn-cgi/trace", host_name);
-    
+
     let curl_process = Command::new("curl")
         .arg("/dev/null")
         .arg("-I")
         .arg(url)
         .arg("-s")
         .arg("-m")
-        .arg("10") // 设置超时(单位：秒)
+        .arg("8") // 设置超时(单位：秒)
         .stdout(Stdio::piped())
         .spawn();
-        
+
     // 检查curl进程是否成功启动
     match curl_process {
         Ok(child) => {
@@ -94,9 +85,7 @@ fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
             }
             return Ok((host_name.to_string(), false));
         }
-        Err(_e) => {
-            return Ok((host_name.to_string(),false))
-        }
+        Err(_e) => return Ok((host_name.to_string(), false)),
     }
 }
 
@@ -116,7 +105,6 @@ fn extract_server_header(curl_output: &str) -> Option<String> {
 
 // 检查文件读取的地址是IPv4地址、IPv6地址、域名，如果是CIDR，就生成IP地址
 fn generate_ip_and_check_ip_type(ip_address: &str) -> Vec<String> {
-    
     // 是CIDR的，处理方案
     if let Ok(ip_network) = ip_address.parse::<IpNetwork>() {
         if ip_network.is_ipv6() {
@@ -125,7 +113,8 @@ fn generate_ip_and_check_ip_type(ip_address: &str) -> Vec<String> {
                 let mut addresses = Vec::new();
                 let num_addresses = 500; // 生成最多500个IPv6地址
 
-                let generated_addresses: Vec<Ipv6Addr> = generate_random_ipv6_in_cidr(&ip_network, &mut rng, num_addresses);
+                let generated_addresses: Vec<Ipv6Addr> =
+                    generate_random_ipv6_in_cidr(&ip_network, &mut rng, num_addresses);
 
                 for ip in generated_addresses {
                     addresses.push(ip.to_string());
@@ -150,7 +139,11 @@ fn generate_ip_and_check_ip_type(ip_address: &str) -> Vec<String> {
 }
 
 // 生成IPv6 CIDR范围内的随机500个IPv6地址
-fn generate_random_ipv6_in_cidr(ip_network: &IpNetwork, rng: &mut impl Rng, num_addresses: usize) -> Vec<Ipv6Addr> {
+fn generate_random_ipv6_in_cidr(
+    ip_network: &IpNetwork,
+    rng: &mut impl Rng,
+    num_addresses: usize,
+) -> Vec<Ipv6Addr> {
     if let IpNetwork::V6(cidr) = ip_network {
         let lower = u128::from(cidr.network());
         let upper = u128::from(cidr.broadcast());
@@ -179,13 +172,12 @@ fn generate_random_ipv6_in_cidr(ip_network: &IpNetwork, rng: &mut impl Rng, num_
     }
 }
 
-
 // 按行读取文件的内容
 fn read_ips_file(file_path: &str) -> Result<Vec<String>, io::Error> {
     let file = match File::open(file_path) {
         Ok(file) => file,
         Err(e) => {
-            println!("打开{}文件错误，错误原因是:{}", file_path, e);
+            println!("打开{}文件失败，错误原因是:{}", file_path, e);
             print!("按Enter键退出程序！");
             io::stdout().flush().expect("Failed to flush stdout");
             let _ = io::stdin().read_line(&mut String::new());
@@ -246,26 +238,18 @@ fn wait_for_enter() {
     io::stdout().flush().expect("Failed to flush stdout");
 
     let mut input = String::new();
-    io::stdin().read_line(&mut input).expect("Failed to read line");
+    io::stdin()
+        .read_line(&mut input)
+        .expect("Failed to read line");
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = Instant::now();
-    init_logger()?;
-    let ip_addresses = read_ips_file("ips-v4.txt")?;
-    
-    if !is_curl_installed(){
-        println!("电脑中，没有安装有curl命令！按Enter键退出程序！");
-        io::stdout().flush().expect("Failed to flush stdout");
-        let _ = io::stdin().read_line(&mut String::new());
-        std::process::exit(1);
-    }
-
-    // 线程池：生成CIDR范围的IP地址
-    let pool_generate = threadpool::ThreadPool::new(20);
+// 处理IP地址，检测到是cidr，就生成IP地址，不是就直接添加ips中
+fn process_ip_addresses(ip_addresses: Vec<String>, pool_size: usize) -> Vec<String> {
+    let pool_generate = ThreadPool::new(pool_size);
     let (tx_generate, rx_generate) = mpsc::channel();
+    let ip_addresses = Arc::new(Mutex::new(ip_addresses));
 
-    for item in ip_addresses.iter() {
+    for item in ip_addresses.lock().unwrap().iter() {
         let tx_generate = tx_generate.clone();
         let cloned_item = item.clone();
         pool_generate.execute(move || {
@@ -273,52 +257,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tx_generate.send(ips).unwrap();
         });
     }
-
-    drop(tx_generate);  // 释放发送端。不影响要接受的(rx_generate)信息；同时便于后续迭代
-    
-    println!("开始扫描CF CDN中...\n");
+    // 释放发送端。不影响要接受的(rx_generate)信息；同时便于后续迭代
+    drop(tx_generate);
 
     let mut ips: Vec<String> = Vec::new();
     // 从接受端迭代结果放到ips中
     for ips_batch in rx_generate.iter() {
         ips.extend(ips_batch);
     }
-
     let mut rng = rand::thread_rng();
     ips.shuffle(&mut rng); // 打乱排列顺序
-    
-    
-    // 线程池：调用check_server_is_cloudflare函数，获取测试后的结果
-    let pool_method = threadpool::ThreadPool::new(100);
+
+    ips
+}
+
+// 间接调用check_server_is_cloudflare函数，获取测试后的结果，并排序
+fn process_ips_and_filter_cloudflare(ips: Vec<String>, pool_size: usize) -> Vec<String> {
+    let pool_method = ThreadPool::new(pool_size);
     /* mpsc通道，用于在线程之间安全地传递数据，其中一个线程（或多个线程）充当生产者，而另一个线程（单个线程）充当消费者。
        mpsc（多个生产者、单个消费者）通道，创建了两个端点，一个发送端 (tx_method) 和一个接收端 (rx_method)。
        这种通道类型在并发编程中非常有用，因为它提供了一种线程间通信的方式，以避免竞态条件和数据竞争。
     */
-    let (tx_method, rx_method) = mpsc::channel(); 
-
-    for item in ips.iter() {
+    let (tx_method, rx_method) = mpsc::channel();
+    let ips = Arc::new(Mutex::new(ips));
+    for item in ips.lock().unwrap().iter() {
         let tx_method = tx_method.clone();
         let cloned_item = item.clone();
         pool_method.execute(move || {
             if let Ok((ip, state)) = check_server_is_cloudflare(&cloned_item) {
-                log::info!("SCANER {}/cdn-cgi/trace --> RESULT: {}", ip, state);
+                log::info!("{}/cdn-cgi/trace -> Result: {}", ip, state);
                 if state {
                     tx_method.send(ip).unwrap();
                 }
             }
         });
     }
-    
-    drop(tx_method); // 释放发送端。不影响要接受的(rx_method)信息；同时便于后续迭代
-
+    // 释放发送端。不影响要接受的(rx_method)信息；同时便于后续迭代
+    drop(tx_method);
     let mut reachable_ips: Vec<String> = Vec::new();
     // 从接受端迭代结果放到reachable_ips中
     for ip in rx_method.iter() {
         let cleaned_ip = ip.trim_matches(|c| c == '[' || c == ']'); // 去掉IPv6地址的方括号
         reachable_ips.push(cleaned_ip.to_string());
     }
-    // 排序
+    // 调用reachable_ips函数排序(先根据IP地址排序，域名在后面)
     reachable_ips.sort_by(|ip1, ip2| custom_ip_sort(ip1, ip2));
+
+    reachable_ips
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let start_time = Instant::now();
+    init_logger()?;
+    let ip_addresses = read_ips_file("ips-v4.txt")?;
+
+    // 检测curl命令
+    if !is_curl_installed() {
+        println!("电脑中，没有安装有curl命令！按Enter键退出程序！");
+        io::stdout().flush().expect("Failed to flush stdout");
+        let _ = io::stdin().read_line(&mut String::new());
+        std::process::exit(1);
+    }
+
+    // 使用线程池处理IP地址(是CIDR的就生成IP地址，不是就直接添加到向量中)
+    let pool_size = 20;
+    let ips = process_ip_addresses(ip_addresses, pool_size);
+
+    println!("开始扫描 cdn-cgi/trace 中...\n");
+
+    // 通过process_ips_and_filter_cloudflare函数间接调用check_server_is_cloudflare函数，获取测试后的结果
+    let pool_size = 200;
+    let reachable_ips = process_ips_and_filter_cloudflare(ips, pool_size);
+
     // 写入文件中
     write_to_file(&reachable_ips, "output.txt")?;
 
@@ -329,9 +339,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 转换为人类易读的时间
     let (elapsed_time, unit) = format_duration(elapsed_duration);
 
-    print!("\n程序运行结束，耗时：{:.2}{}，", elapsed_time,unit);
+    print!("\n程序运行结束，耗时：{:.2}{}，", elapsed_time, unit);
     io::stdout().flush().expect("Failed to flush stdout");
     wait_for_enter();
-    
+
     Ok(())
 }
