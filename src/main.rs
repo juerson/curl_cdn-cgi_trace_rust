@@ -1,88 +1,183 @@
 mod utils;
 
-use std::{
-    io::{self, Write},
-    sync::{mpsc, Arc, Mutex},
-    time::{Duration, Instant},
-};
+use crate::utils::models::Airport;
+use std::{ fs::{ self }, sync::{ mpsc, Arc, Mutex }, time::Instant };
+use reqwest::Error;
 use threadpool::ThreadPool;
+use clap::Parser;
+// use clap::CommandFactory;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 检测curl命令
-    if !utils::curl::is_curl_installed() {
-        println!("电脑中，没有安装有curl命令！按Enter键退出程序！");
-        io::stdout().flush().expect("Failed to flush stdout");
-        let _ = io::stdin().read_line(&mut String::new());
-        std::process::exit(1);
-    }
-    let start_time = Instant::now();
+/// 批量扫描是否走CloudFlare CDN的流量。
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// 输入的数据文件(*.txt)，支持域名地址、IPv4/IPv6地址、IPv4/IPv6的CIDR的数据
+    #[arg(short = 'f', default_value_t = format!("ips-v4.txt"))]
+    file: String,
 
-    // 初始化日记
-    utils::logger::init_logger()?;
+    /// 数据输出的文件，结果输出到这个文件中
+    #[arg(short = 'o', default_value_t = format!("output.csv"))]
+    output: String,
 
-    match utils::files::read_text_file() {
-        Ok(ips) => {
-            // 使用线程池处理IP地址(是CIDR的就生成IP地址，不是就直接添加到向量中)
-            let pool_size = 20;
-            let ips = utils::network::process_ip_cidr_hosts(ips, pool_size);
+    /// 如果是IPv4/IPv6的CIDR，就它的范围，随机生成指定数量的IP地址
+    #[arg(short, default_value_t = 1)]
+    num: usize,
 
-            println!("开始扫描 cdn-cgi/trace 中...\n");
+    /// 同时并行执行的任务数量，拿多个地址并行执行curl命令
+    #[arg(long, default_value_t = 50)]
+    pool: u16,
 
-            // 通过process_ips_and_filter_cloudflare函数间接调用check_server_is_cloudflare函数，获取测试后的结果
-            let pool_size = 200;
-            let reachable_ips = process_ips_and_filter_cloudflare(ips, pool_size);
+    /// 只扫描是否为jetbrains的许可证服务器
+    #[arg(long, default_value_t = false)]
+    jetbrains: bool,
+}
 
-            // 写入文件中
-            utils::files::write_to_file(&reachable_ips, "output.txt")?;
+static LOCATIONS: &str = "locations.json";
+static LOCATIONS_URL: &str = "https://speed.cloudflare.com/locations";
 
-            // 记录结束的时间
-            let end_time = Instant::now();
-            // 计算程序运行的总时长
-            let elapsed_duration: Duration = end_time.duration_since(start_time);
-            // 转换为人类易读的时间
-            let (elapsed_time, unit) = utils::common::format_duration(elapsed_duration);
-
-            print!("\n任务运行完毕，耗时：{:.2}{}，", elapsed_time, unit);
-            io::stdout().flush().expect("Failed to flush stdout");
-            utils::common::wait_for_enter();
-        }
-        Err(e) => eprintln!("读取txt文件时发生错误: {}", e),
-    }
-
+/// 用于下载locations.json文件
+async fn download_file(url: &str, path: &str) -> Result<(), Error> {
+    let response = reqwest::get(url).await?;
+    let content = response.text().await?;
+    fs::write(path, content).expect("Unable to write file");
     Ok(())
 }
 
-// 间接调用check_server_is_cloudflare函数，获取测试后的结果，并排序
-fn process_ips_and_filter_cloudflare(ips: Vec<String>, pool_size: usize) -> Vec<String> {
-    let pool_method = ThreadPool::new(pool_size);
-    /* mpsc通道，用于在线程之间安全地传递数据，其中一个线程（或多个线程）充当生产者，而另一个线程（单个线程）充当消费者。
-       mpsc（多个生产者、单个消费者）通道，创建了两个端点，一个发送端 (tx_method) 和一个接收端 (rx_method)。
-       这种通道类型在并发编程中非常有用，因为它提供了一种线程间通信的方式，以避免竞态条件和数据竞争。
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 检测curl是否安装，没有安装就退出程序
+    utils::curl::check_curl_installed();
+    // 初始化日记
+    utils::logger::init_logger()?;
+
+    let args = Args::parse();
+    /*
+        检查是否未提供任何参数（程序名称除外）
+        注释掉这个if条件，如果设置Args的默认参数值，双击编译后的exe程序会自动执行
     */
-    let (tx_method, rx_method) = mpsc::channel();
-    let ips = Arc::new(Mutex::new(ips));
-    for item in ips.lock().unwrap().iter() {
-        let tx_method = tx_method.clone();
-        let cloned_item = item.clone();
-        pool_method.execute(move || {
-            if let Ok((ip, state)) = utils::curl::check_server_is_cloudflare(&cloned_item) {
-                log::info!("{}/cdn-cgi/trace -> Result: {}", ip, state);
-                if state {
-                    tx_method.send(ip).unwrap();
+    // if std::env::args().len() <= 1 {
+    //     // 显示帮助信息
+    //     let mut cmd = Args::command();
+    //     cmd.print_help().unwrap();
+    //     std::process::exit(0);
+    // }
+
+    // 加载locations.json文件
+    let locations = match fs::read_to_string(LOCATIONS) {
+        Ok(data) => data,
+        Err(_) => {
+            // 文件不存在或读取失败，下载文件
+            download_file(LOCATIONS_URL, LOCATIONS).await?;
+            fs::read_to_string(LOCATIONS).expect("Unable to read file")
+        }
+    };
+
+    // 解析为 Airport 结构体
+    let airports: Vec<Airport> = serde_json::from_str(&locations)?;
+    let start_time = Instant::now();
+    match utils::files::read_text_file(&args.file) {
+        Ok(line) => {
+            let data_vec = utils::network::process_ip_cidr_hosts(line, 20, args.num);
+
+            println!("开始扫描 cdn-cgi/trace 中...\n");
+            let (tx_method, rx_method) = mpsc::channel();
+            let pool_method = ThreadPool::new(args.pool.into());
+            let arc_addr = Arc::new(Mutex::new(data_vec));
+            for addr in arc_addr.lock().unwrap().iter() {
+                let tx_method = tx_method.clone();
+                let cloned_addr = addr.clone();
+                let airports = airports.clone();
+                pool_method.execute(move || {
+                    match
+                        utils::curl::run_command_and_process_data(
+                            &cloned_addr,
+                            airports,
+                            args.jetbrains
+                        )
+                    {
+                        Ok(record) => tx_method.send(record).unwrap(),
+                        Err(_e) => {}
+                    }
+                });
+            }
+            drop(tx_method);
+
+            let mut records: Vec<Vec<String>> = Vec::new();
+            // 读取通道数据，添加到records向量中
+            rx_method.iter().for_each(|item| {
+                let delay = item.delay.as_millis();
+                let vec = vec![
+                    item.ip.clone(),
+                    item.colo.clone(),
+                    item.country.clone(),
+                    item.region.clone(),
+                    item.city.clone(),
+                    delay.to_string(),
+                    item.http_status_code.to_string()
+                ];
+                records.push(vec);
+            });
+
+            // ----------------------------------------------------------------------------
+
+            // 按延迟(毫秒)排序，注意：延迟没有单位ms和s的字符串
+            records.sort_by(|a, b| {
+                let latency_a: i32 = a[5].parse().unwrap_or(i32::MAX);
+                let latency_b: i32 = b[5].parse().unwrap_or(i32::MAX);
+                latency_a.cmp(&latency_b) // 比较
+            });
+
+            // 将标题行添加到开头
+            records.insert(
+                0,
+                vec![
+                    "IP地址".to_string(),
+                    "数据中心".to_string(),
+                    "alpha-2".to_string(),
+                    "地区".to_string(),
+                    "城市".to_string(),
+                    "延迟(毫秒)".to_string(), // 该值仅供参考，只是执行curl命令的耗时
+                    "HTTP状态码".to_string()
+                ]
+            );
+
+            // ----------------------------------------------------------------------------
+            match args.jetbrains {
+                true => {
+                    // 过滤掉不需要的列
+                    let mut jetbrains_records: Vec<Vec<String>> = Vec::new();
+
+                    // 添加标题，包含 "jetBrains激活服务器" 列
+                    let header: Vec<String> = vec![
+                        "IP地址".to_string(),
+                        "延迟(毫秒)".to_string(),
+                        "HTTP状态码".to_string(),
+                        "jetBrains激活服务器".to_string()
+                    ];
+                    jetbrains_records.push(header);
+
+                    // 遍历原始记录并保留需要的列，以及插入新列
+                    for row in records.iter().skip(1) {
+                        let mut new_row: Vec<String> = Vec::new();
+                        new_row.push(row[0].clone()); // 添加第一列
+                        new_row.push(row[row.len() - 2].clone()); // 添加倒数第二列
+                        new_row.push(row[row.len() - 1].clone()); // 添加倒数第一列
+                        new_row.push("true".to_string()); // JetBrains License server
+                        jetbrains_records.push(new_row);
+                    }
+
+                    // 写入CSV文件
+                    utils::files::write_to_csv(&args.output, jetbrains_records)?;
+                }
+                false => {
+                    // 写入CSV文件
+                    utils::files::write_to_csv(&args.output, records)?;
                 }
             }
-        });
+        }
+        Err(e) => eprintln!("读取txt文件时发生错误: {}", e),
     }
-    // 释放发送端。不影响要接受的(rx_method)信息；同时便于后续迭代
-    drop(tx_method);
-    let mut reachable_ips: Vec<String> = Vec::new();
-    // 从接受端迭代结果放到reachable_ips中
-    for ip in rx_method.iter() {
-        let cleaned_ip = ip.trim_matches(|c| c == '[' || c == ']'); // 去掉IPv6地址的方括号
-        reachable_ips.push(cleaned_ip.to_string());
-    }
-    // 调用reachable_ips函数排序(先根据IP地址排序，域名在后面)
-    reachable_ips.sort_by(|ip1, ip2| utils::common::sort_ips_and_hosts(ip1, ip2));
+    println!("\n程序扫描的总时长: {:?}", start_time.elapsed());
 
-    reachable_ips
+    Ok(())
 }
