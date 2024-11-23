@@ -1,28 +1,30 @@
+use crate::utils::models::Airport;
+use crate::utils::models::Record;
+
 use ipnetwork::IpNetwork;
-use std::io;
-use std::process::Command;
-use std::process::Stdio;
+use log::{ info, warn };
+use std::{ io::{ self, Write }, process::{ Command, Stdio }, time::Instant };
 use url::Url;
 
-// 检查curl是否已经在电脑中安装好
-pub fn is_curl_installed() -> bool {
-    // 检查命令执行是否成功
-    let output = Command::new("curl").arg("--version").output().is_ok();
-
-    output
+// 检查curl是否已安装，没有就退出程序
+pub fn check_curl_installed() {
+    if !Command::new("curl").arg("--version").output().is_ok() {
+        print!("电脑中，没有安装有curl命令！按Enter键退出程序！");
+        io::stdout().flush().expect("Failed to flush stdout");
+        let _ = io::stdin().read_line(&mut String::new());
+        std::process::exit(1);
+    }
 }
 
-// 使用CURL命令（需要在电脑中安装curl才能使用，特别是windows系统中），判断headers头文件信息是否有cloudflare字符
-pub fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error> {
+pub fn run_command_and_process_data(
+    ip: &str,
+    airports: Vec<Airport>,
+    jetbrains: bool
+) -> Result<Record, io::Error> {
     let formatted_ip = if let Ok(ip_network) = ip.parse::<IpNetwork>() {
-        if ip_network.is_ipv6() {
-            format!("[{}]", ip)
-        } else {
-            ip_network.ip().to_string()
-        }
+        if ip_network.is_ipv6() { format!("[{}]", ip) } else { ip_network.ip().to_string() }
     } else {
         let trimmed_ip = if ip.ends_with('/') {
-            // 用于去掉右侧"/"的字符
             ip.trim_end_matches('/').to_string()
         } else {
             ip.to_string()
@@ -36,15 +38,14 @@ pub fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error>
     } else {
         formatted_ip
     };
-    let url = format!("http://{}/cdn-cgi/trace", host_name);
+    let url: String = match jetbrains {
+        true => ip.to_string(),
+        false => format!("http://{}/cdn-cgi/trace", host_name),
+    };
+    let start_time = Instant::now(); // 开始时间
 
     let curl_process = Command::new("curl")
-        .arg("/dev/null")
-        .arg("-I")
-        .arg(url)
-        .arg("-s")
-        .arg("-m")
-        .arg("8") // 设置超时(单位：秒)
+        .args(["/dev/null", "-I", &url, "-s", "--connect-timeout", "3", "--max-time", "10"])
         .stdout(Stdio::piped())
         .spawn();
 
@@ -52,29 +53,75 @@ pub fn check_server_is_cloudflare(ip: &str) -> Result<(String, bool), io::Error>
     match curl_process {
         Ok(child) => {
             let output = child.wait_with_output()?; // 等待子进程完成
+            let elapsed_duration = start_time.elapsed(); // 结束时间
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // 如果curl输出中，server参数中是"cloudflare"
-            if let Some(server_header) = extract_server_header(&stdout) {
-                if server_header.contains("cloudflare") {
-                    return Ok((host_name.to_string(), true));
+            let lines: Vec<&str> = stdout.lines().collect();
+            let mut status_code = String::new();
+            for line in lines {
+                if line.starts_with("HTTP/1.1") {
+                    let parts: Vec<&str> = line.split(' ').collect();
+                    if parts.len() >= 2 {
+                        status_code = parts[1].to_string();
+                    }
+                } else if jetbrains == false && line.starts_with("CF-RAY:") {
+                    if let Some(pos) = line.rfind('-') {
+                        // 获取 `"-"` 后面的部分
+                        let colo = &line[pos + 1..]; // +1 是为了跳过 `"-"` 字符
+                        match airports.iter().find(|a| a.iata == colo) {
+                            Some(airport) => {
+                                let record = Record {
+                                    ip: ip.to_string(),
+                                    colo: colo.to_string(),
+                                    country: airport.cca2.clone(),
+                                    region: airport.region.clone(),
+                                    city: airport.city.clone(),
+                                    delay: elapsed_duration,
+                                    http_status_code: status_code,
+                                    is_jetbrains: false, // 这里没有扫描，不代表不是JetBrains的许可证服务器
+                                };
+                                info!(
+                                    "{} | {} | {} | {} | {} | {} ms",
+                                    ip,
+                                    colo,
+                                    airport.cca2,
+                                    airport.region,
+                                    airport.city,
+                                    elapsed_duration.as_millis()
+                                );
+                                return Ok(record);
+                            }
+                            None => {}
+                        }
+                    }
+                } else if
+                    jetbrains == true &&
+                    line.starts_with("Location: https://account.jetbrains.com/fls-auth")
+                {
+                    let record = Record {
+                        ip: ip.to_string(),
+                        colo: "".to_string(),
+                        country: "".to_string(),
+                        region: "".to_string(),
+                        city: "".to_string(),
+                        delay: elapsed_duration,
+                        http_status_code: status_code,
+                        is_jetbrains: true,
+                    };
+                    info!("{} | JetBrains License server | {}", ip, elapsed_duration.as_millis());
+                    return Ok(record);
                 }
             }
-            return Ok((host_name.to_string(), false));
+            // 都不符合条件的情况
+            if jetbrains {
+                warn!("{} | 连接失败/超时，响应头中，找不到jetbrains相关的fls-auth信息！", ip);
+            } else {
+                warn!("{} | 连接失败/超时，响应头中，找不到CloudFlare相关的信息！", ip);
+            }
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "未知错误！"));
         }
-        Err(_e) => return Ok((host_name.to_string(), false)),
-    }
-}
-
-// 提取响应头的server服务器是什么？cloudflare？
-fn extract_server_header(curl_output: &str) -> Option<String> {
-    let lines: Vec<&str> = curl_output.lines().collect();
-
-    for line in lines {
-        if line.starts_with("Server:") {
-            // 删除前后的空格并返回值
-            return Some(line["Server:".len()..].trim().to_string());
+        Err(_e) => {
+            warn!("{} | CURL启动失败", ip);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "未知错误！"));
         }
     }
-
-    None
 }
