@@ -1,87 +1,42 @@
-use std::{
-    fs::{self, File},
-    io::{self, BufRead, Write},
-};
+use std::{ collections::HashSet, error::Error, fs::File, io::{ self, BufRead, Write }, path::Path };
+use csv::Writer;
 
-// 将结果写入文件
-pub fn write_to_file(data: &[String], file_name: &str) -> Result<(), io::Error> {
-    let mut file = File::create(file_name)?;
-    for ip in data {
-        writeln!(file, "{}", ip)?;
-    }
-    Ok(())
-}
-
-// 按行读取文件的内容(读取当前目录中第一个txt文件，并排除output.txt文件)
-pub fn read_text_file() -> Result<Vec<String>, io::Error> {
-    let current_dir = ".";
-    let txt_files: Vec<String> = fs::read_dir(current_dir)?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let path = entry.path();
-            // 判断文件扩展名是".txt"，并且文件名不为"output.txt"
-            path.is_file()
-                && path.extension().and_then(|s| s.to_str()) == Some("txt")
-                && path.file_name().and_then(|s| s.to_str()) != Some("output.txt")
-        })
-        .filter_map(|entry| entry.path().to_str().map(|s| s.to_string()))
-        .collect();
-
-    if txt_files.is_empty() {
-        println!("当前目录没有找到合适的TXT文件，按Enter键退出程序！");
-        io::stdout().flush().expect("Failed to flush stdout");
-        let _ = io::stdin().read_line(&mut String::new());
-        std::process::exit(1);
-    }
-    // 只选择第一个txt文件的路径
-    let file_path = &txt_files[0];
-    let file = match File::open(file_path) {
+pub fn read_text_file<P>(filename: P) -> io::Result<Vec<String>> where P: AsRef<Path> {
+    let file = match File::open(&filename) {
         Ok(file) => file,
         Err(e) => {
-            println!("打开{}文件失败，错误原因是:{}", file_path, e);
+            let filename_str = filename.as_ref().to_str().unwrap_or("<invalid path>");
+            println!("打开{}文件失败，错误原因是:{}", filename_str, e);
             print!("按Enter键退出程序！");
             io::stdout().flush().expect("Failed to flush stdout");
             let _ = io::stdin().read_line(&mut String::new());
             std::process::exit(1);
         }
     };
+    let buf = io::BufReader::new(file);
+    let mut unique_lines = HashSet::new();
 
-    let ips: Vec<String> = io::BufReader::new(file)
-        .lines()
-        .filter_map(|line| line.ok())
-        .collect();
-
-    if ips.is_empty() {
-        print!("{}文件是空的，按Enter键退出程序！", file_path);
-        io::stdout().flush().expect("Failed to flush stdout");
-        let _ = io::stdin().read_line(&mut String::new());
-        std::process::exit(1);
+    for line in buf.lines() {
+        let line = line?;
+        let trimmed_line = line.trim();
+        if !trimmed_line.is_empty() {
+            unique_lines.insert(trimmed_line.to_string());
+        }
     }
 
-    Ok(ips)
+    // 将HashSet转换为Vec并在需要时对其进行排序
+    let mut unique_lines_vec: Vec<String> = unique_lines.into_iter().collect();
+    unique_lines_vec.sort();
+
+    Ok(unique_lines_vec)
 }
 
-// 按行读取文件的内容（传入具体的txt文件）
-// pub fn read_text_file(file_path: &str) -> Result<Vec<String>, io::Error> {
-//     let file = match File::open(file_path) {
-//         Ok(file) => file,
-//         Err(e) => {
-//             println!("打开{}文件失败，错误原因是:{}", file_path, e);
-//             print!("按Enter键退出程序！");
-//             io::stdout().flush().expect("Failed to flush stdout");
-//             let _ = io::stdin().read_line(&mut String::new());
-//             std::process::exit(1);
-//         }
-//     };
-//     let ips: Vec<String> = io::BufReader::new(file)
-//         .lines()
-//         .filter_map(|line| line.ok())
-//         .collect();
-//     if ips.is_empty() {
-//         print!("{}文件是空的，按Enter键退出程序！", file_path);
-//         io::stdout().flush().expect("Failed to flush stdout");
-//         let _ = io::stdin().read_line(&mut String::new());
-//         std::process::exit(1);
-//     }
-//     Ok(ips)
-// }
+pub fn write_to_csv(csv_file: &str, records: Vec<Vec<String>>) -> Result<(), Box<dyn Error>> {
+    let file = File::create(csv_file)?;
+    let mut wtr = Writer::from_writer(file);
+    for row in records {
+        wtr.write_record(row)?;
+    }
+    wtr.flush()?;
+    Ok(())
+}
